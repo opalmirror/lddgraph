@@ -29,6 +29,15 @@ Solid lines are the versioned symbol requirement dependencies.
 ```
 
 ### EXAMPLES
+The following:
+```
+   ./lddgraph lddgraph | dot -Tpng -Gsize="800,600" \
+      -Nfontsize=10 -Efontsize=8 > img/lddgraph.png
+```
+Produces output like this:
+
+![lddgraph graphs itself](img/lddgraph.png "lddgraph output")
+
 ```
    lddgraph /bin/bash | dot -Tpng > g.png && eog g.png
    lddgraph /usr/lib/libgdal.so | dot -Tpng > g.png; eog g.png
