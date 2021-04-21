@@ -78,6 +78,7 @@
 #include <stdlib.h>             // exit, EXIT_SUCCESS, EXIT_FAILURE
 #include <string.h>             // strerror
 #include <unistd.h>             // access, X_OK
+#include <elf.h>                // ELF constants and offsets
 
 // uncomment for a lot of output to stderr
 //#define DEBUG
@@ -222,7 +223,7 @@ static bool is_ELF_file(std::string path)
         exit(EXIT_FAILURE);
     }
 
-    unsigned char s[4];
+    unsigned char s[EI_NIDENT + sizeof(Elf64_Half)];
 
     size_t n = fread(s, 1, sizeof(s), fp);
 
@@ -235,29 +236,44 @@ static bool is_ELF_file(std::string path)
 
     if (n < sizeof(s))
     {
-        std::cerr << path << ": short read" << std::endl;
+        DEBUG_OUT(std::cerr << path << ": short read" << std::endl);
         fclose(fp);
-        exit(EXIT_FAILURE);
+
+        return false;
     }
 
     fclose(fp);
 
-    unsigned char ELF_header[4] = { 0x7f, 'E', 'L', 'F' };
-
-    if (memcmp(s, ELF_header, sizeof(s)) != 0)
+    if (s[EI_MAG0] != ELFMAG0 || s[EI_MAG1] != ELFMAG1 ||
+        s[EI_MAG2] != ELFMAG2 || s[EI_MAG3] != ELFMAG3 ||
+        !(s[EI_CLASS] == ELFCLASS32 || s[EI_CLASS] == ELFCLASS64) ||
+        !(s[EI_DATA] == ELFDATA2LSB || s[EI_DATA] == ELFDATA2MSB) ||
+        s[EI_VERSION] != EV_CURRENT ||
+        !((s[EI_DATA] == ELFDATA2LSB && s[EI_NIDENT] == ET_DYN &&
+                s[EI_NIDENT + 1] == 0) ||
+          (s[EI_DATA] == ELFDATA2MSB && s[EI_NIDENT] == 0 &&
+                s[EI_NIDENT + 1] == ET_DYN)))
     {
+        DEBUG_OUT(std::cerr << path <<
+            ": not recognized as an ELF dynamic load input file"
+            << std::endl);
         return false;
     }
+
+    unsigned int width = s[EI_CLASS] == ELFCLASS32 ? 32 :
+        s[EI_CLASS] == ELFCLASS64 ? 64 : 0;
+    DEBUG_OUT(std::
+        cerr << path << ": " << width << " bits, dynamic load file" <<
+        std::endl);
 
     return true;
 }
 
-// Process an input file, producing a directed graph description on output
-void parse_file(const std::string patharg)
+FILE *path_open(std::string path, bool &real_path_pending, bool &is_pipe)
 {
-    std::string path = patharg;
     FILE *fp = NULL;
-    bool is_pipe = false;
+    is_pipe = false;
+    real_path_pending = false;
 
     // determine if input is stdin, executable or shared object, or regular
     // file input. executables and shared objects are run through ldd -v to
@@ -265,6 +281,7 @@ void parse_file(const std::string patharg)
     if (path == "-")
     {
         fp = stdin;
+        real_path_pending = true;
     }
     else if (is_ELF_file(path))
     {
@@ -279,6 +296,7 @@ void parse_file(const std::string patharg)
     else if (access(path.c_str(), R_OK) == 0)
     {
         fp = fopen(path.c_str(), "r");
+        real_path_pending = true;
     }
     else
     {
@@ -293,175 +311,11 @@ void parse_file(const std::string patharg)
         exit(EXIT_FAILURE);
     }
 
-    // Prepare a lists of nodes and edges
-    std::vector < Node * >nodes;
-    std::vector < Edge * >edges;
+    return fp;
+}
 
-    // create a root node for the input file, also referred to as nodes[0]
-    Node *cur_node = new Node(trim_dot_slash(path));
-    nodes.push_back(cur_node);
-
-    // we're in the header of the ldd -v output until we see Version info:
-    bool got_version_info = false;
-
-    // read and process lines until EOF
-    while (!feof(fp))
-    {
-        char line[BUFSIZ];
-
-        // use janky old stdout fgets to grab a line
-        if (fgets(line, sizeof(line), fp) == NULL)
-        {
-            break;
-        }
-
-        // convert into vector of strings, f
-        std::vector < std::string > f;
-
-        {
-            std::string line_s = std::string(line);
-            std::istringstream line_is(line_s);
-            std::string fi;
-
-            while (line_is >> fi)
-            {
-                f.push_back(fi);
-            }
-        }
-
-        // input: not a <...>
-        if (f.size() == 4 && f[0] == "not" && f[1] == "a")
-        {
-            std::cerr << path << ": not an dynamically loaded file" << std::endl;
-            exit(EXIT_FAILURE);
-        }
-
-        // input: <path>: <libpath>: version `<symbol>' not found (required by <path>)
-        if (f.size() == 5 && f[2] == "version" && f[4] == "not")
-        {
-            std::cerr << "some symbol versions are unresolvable, input: " << line;
-            continue;
-        }
-
-        // input: Version information:
-        if (f.size() == 2 && f[0] == "Version" && f[1] == "information:")
-        {
-            got_version_info = true;
-            continue;
-        }
-
-        // input: <lib> (<loadaddr>)
-        // input: <lib> => <path> (<loadaddr>)
-        if (got_version_info == false && (f.size() == 2 || f.size() == 4))
-        {
-            std::string field(f.size() == 2 ? f[0] : f[2]);
-
-            // input: <lib> => not found
-            if (f.size() == 4 && f[2] == "not" && f[3] == "found")
-            {
-                std::cerr << f[0] << ": library not found, input: " << line;
-                field = f[0];
-            }
-
-            Node *sub_node = new Node(trim_dot_slash(field));
-
-            nodes.push_back(sub_node);
-
-            Edge *edge = new Edge(cur_node, sub_node);
-            edges.push_back(edge);
-
-            continue;
-        }
-
-        if (got_version_info == false)
-        {
-            continue;
-        }
-
-        // input: <path>:
-        if (f.size() == 1)
-        {
-            std::string field = trim_dot_slash(trim_trailing_colon(f[0]));
-
-            if (path == "-")
-            {
-                nodes[0]->setPath(field);
-                path = field;
-                DEBUG_OUT(std::cerr << "reset path - to " << path << std::endl);
-            }
-
-            Node *sub_node = NULL;
-
-            for (std::vector < Node * >::iterator pn = nodes.begin();
-                pn != nodes.end(); ++pn)
-            {
-                if ((*pn)->getPath() == field)
-                {
-                    sub_node = *pn;
-                    break;
-                }
-            }
-
-            if (sub_node == NULL)
-            {
-                std::cerr << field << ": cannot find prior reference!" << std::endl;
-                exit(EXIT_FAILURE);
-            }
-
-            cur_node = sub_node;
-
-            continue;
-        }
-
-        // input: <library> (<version>) => <path>
-        if (f.size() == 4)
-        {
-            std::string version(trim_outer_parens(f[1]));
-            std::string field = trim_dot_slash(f[3]);
-            Node *sub_node = NULL;
-
-            for (std::vector < Node * >::iterator pn = nodes.begin();
-                pn != nodes.end(); ++pn)
-            {
-                if ((*pn)->getPath() == field)
-                {
-                    sub_node = *pn;
-                    break;
-                }
-            }
-
-            if (sub_node == NULL)
-            {
-                std::cerr << field << ": cannot find prior reference!" <<
-                    std::endl;
-                exit(EXIT_FAILURE);
-            }
-
-            // add label to existing edge, or create new edge
-
-            bool found = false;
-
-            for (std::vector < Edge * >::iterator pe = edges.begin();
-                pe != edges.end(); ++pe)
-            {
-                if ((*pe)->getFrom() == cur_node && (*pe)->getTo() == sub_node)
-                {
-                    found = true;
-                    (*pe)->addLabel(version);
-                }
-            }
-
-            if (found == false)
-            {
-                Edge *edge = new Edge(cur_node, sub_node);
-                edge->addLabel(version);
-                edges.push_back(edge);
-            }
-
-            continue;
-        }
-    }
-
+void path_close(FILE * &fp, std::string & path, bool &is_pipe)
+{
     // if error, quit while we're behind
     if (!feof(fp))
     {
@@ -482,20 +336,174 @@ void parse_file(const std::string patharg)
             std::endl;
         exit(EXIT_FAILURE);
     }
+}
 
-    // Debug dump
-    for (std::vector < Node * >::iterator pn = nodes.begin(); pn != nodes.end();
-        ++pn)
+bool process_line(FILE * fp, std::string & path, bool &real_path_pending,
+    std::vector < Node * >&nodes, std::vector < Edge * >&edges,
+    Node * &cur_node, bool &got_version_info)
+{
+    char line[BUFSIZ];
+
+    // use janky old stdout fgets to grab a line
+    if (fgets(line, sizeof(line), fp) == NULL)
     {
-        (*pn)->dump();
+        return false;
     }
 
-    for (std::vector < Edge * >::iterator pe = edges.begin(); pe != edges.end();
-        ++pe)
+    // convert into vector of strings, f
+    std::vector < std::string > f;
+
     {
-        (*pe)->dump();
+        std::string line_s = std::string(line);
+        std::istringstream line_is(line_s);
+        std::string fi;
+
+        while (line_is >> fi)
+        {
+            f.push_back(fi);
+        }
     }
 
+    // input: not a <...>
+    if (f.size() == 4 && f[0] == "not" && f[1] == "a")
+    {
+        std::cerr << path << ": not an dynamically loaded file" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    // input: <path>: <libpath>: version `<symbol>' not found (required by <path>)
+    if (f.size() == 5 && f[2] == "version" && f[4] == "not")
+    {
+        std::cerr << "some symbol versions are unresolvable, input: " << line;
+        return true;
+    }
+
+    // input: Version information:
+    if (f.size() == 2 && f[0] == "Version" && f[1] == "information:")
+    {
+        got_version_info = true;
+        return true;
+    }
+
+    // input: <lib> (<loadaddr>)
+    // input: <lib> => <path> (<loadaddr>)
+    if (got_version_info == false && (f.size() == 2 || f.size() == 4))
+    {
+        std::string field(f.size() == 2 ? f[0] : f[2]);
+
+        // input: <lib> => not found
+        if (f.size() == 4 && f[2] == "not" && f[3] == "found")
+        {
+            std::cerr << f[0] << ": library not found, input: " << line;
+            field = f[0];
+        }
+
+        Node *sub_node = new Node(trim_dot_slash(field));
+
+        nodes.push_back(sub_node);
+
+        Edge *edge = new Edge(cur_node, sub_node);
+        edges.push_back(edge);
+
+        return true;
+    }
+
+    if (got_version_info == false)
+    {
+        return true;
+    }
+
+    // input: <path>:
+    if (f.size() == 1)
+    {
+        std::string field = trim_dot_slash(trim_trailing_colon(f[0]));
+
+        // we've been waiting for the ldd output to tell us what the
+        // real file's path is.
+        if (real_path_pending)
+        {
+            DEBUG_OUT(std::cerr << "reset path " << path << " to " <<
+                   field << std::endl);
+            nodes[0]->setPath(field);
+            path = field;
+            real_path_pending = false;
+        }
+
+        Node *sub_node = NULL;
+
+        for (std::vector < Node * >::iterator pn = nodes.begin();
+            pn != nodes.end(); ++pn)
+        {
+            if ((*pn)->getPath() == field)
+            {
+                sub_node = *pn;
+                break;
+            }
+        }
+
+        if (sub_node == NULL)
+        {
+            std::cerr << field << ": cannot find prior reference!" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        cur_node = sub_node;
+
+        return true;
+    }
+
+    // input: <library> (<version>) => <path>
+    if (f.size() != 4)
+    {
+        return true;
+    }
+
+    std::string version(trim_outer_parens(f[1]));
+    std::string field = trim_dot_slash(f[3]);
+    Node *sub_node = NULL;
+
+    for (std::vector < Node * >::iterator pn = nodes.begin();
+        pn != nodes.end(); ++pn)
+    {
+        if ((*pn)->getPath() == field)
+        {
+            sub_node = *pn;
+            break;
+        }
+    }
+
+    if (sub_node == NULL)
+    {
+        std::cerr << field << ": cannot find prior reference!" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    // add label to existing edge, or create new edge
+
+    bool found = false;
+
+    for (std::vector < Edge * >::iterator pe = edges.begin();
+        pe != edges.end(); ++pe)
+    {
+        if ((*pe)->getFrom() == cur_node && (*pe)->getTo() == sub_node)
+        {
+            found = true;
+            (*pe)->addLabel(version);
+        }
+    }
+
+    if (found == false)
+    {
+        Edge *edge = new Edge(cur_node, sub_node);
+        edge->addLabel(version);
+        edges.push_back(edge);
+    }
+
+    return true;
+}
+
+void trim_unlabeled_edges(std::vector < Edge * >&edges)
+{
     DEBUG_OUT(std::cerr << "edge count " << edges.size() << std::endl);
 
     // erase unlabeled edges with a to node for which there is a labeled edge pointing to it
@@ -535,7 +543,11 @@ void parse_file(const std::string patharg)
 
     edges = saved_edges;
     DEBUG_OUT(std::cerr << "edge count " << edges.size() << std::endl);
+}
 
+void print_output(std::string & path, std::vector < Node * >&nodes,
+    std::vector < Edge * >&edges)
+{
     // Begin output file on stdout
     std::cout << "digraph G {" << std::endl;
     std::cout << "info_block [shape=box, label=\"" << "file: " << path <<
@@ -582,6 +594,56 @@ void parse_file(const std::string patharg)
 
     // end digraph output
     std::cout << "}" << std::endl;
+}
+
+// Process an input file, producing a directed graph description on output
+void parse_file(std::string path)
+{
+    FILE *fp = NULL;
+    bool is_pipe = false;
+    bool real_path_pending = false;
+
+    fp = path_open(path, real_path_pending, is_pipe);
+
+    // Prepare a lists of nodes and edges
+    std::vector < Node * >nodes;
+    std::vector < Edge * >edges;
+
+    // create a root node for the input file, also referred to as nodes[0]
+    Node *cur_node = new Node(trim_dot_slash(path));
+    nodes.push_back(cur_node);
+
+    // we're in the header of the ldd -v output until we see Version info:
+    bool got_version_info = false;
+
+    // read and process lines until EOF
+    while (!feof(fp))
+    {
+        if (process_line(fp, path, real_path_pending, nodes, edges, cur_node,
+                got_version_info) == false)
+        {
+            break;
+        }
+    }
+
+    path_close(fp, path, is_pipe);
+
+    // Debug dump
+    for (std::vector < Node * >::iterator pn = nodes.begin(); pn != nodes.end();
+        ++pn)
+    {
+        (*pn)->dump();
+    }
+
+    for (std::vector < Edge * >::iterator pe = edges.begin(); pe != edges.end();
+        ++pe)
+    {
+        (*pe)->dump();
+    }
+
+    trim_unlabeled_edges(edges);
+
+    print_output(path, nodes, edges);
 }
 
 // main function
