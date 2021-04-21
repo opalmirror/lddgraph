@@ -16,11 +16,13 @@ argument, or the output of running ldd -v in a file argument or stdin
 The output DOT file may be passed to the 'dot' command to plot it into a
 displayable format.
 
-Dashed lines are direct loader dependencies, at the top of the ldd -v
-listing - they show all the things ld.so will load along with the
-root executable or shared object.
+ld.so (the Linux ELF loader) will load and relocate every node of the
+output graph -- all the objects listed at the top of the ldd -v output.
 
 Solid lines are the versioned symbol requirement dependencies.
+
+Dotted lines are direct loader dependencies that weren't pulled in by
+the more-explicit versioned symbol dependencies.
 
 ### OPTIONS
 ```

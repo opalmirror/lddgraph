@@ -7,22 +7,24 @@
  *   lddgraph <ldd-output-file> | dot -Tpng > g.png; eog g.png
  *   cat <ldd-output-file> | lddgraph - | dot -Tpng > g.png; eog g.png
  *
- * DECRIPTION
- *   examine the dynamically loaded executable or shared object file given as an
+ * DESCRIPTION
+ *   Examine the dynamically loaded executable or shared object file given as an
  *   argument, or the output of running ldd -v in a file argument or stdin (with
  *   - argument), and emit a graphviz directed graph DOT file on stdout.
  *
  *   The output DOT file may be passed to the 'dot' command to plot it into a
- *   displayable format.
+ *   displayable format (e.g. png).
  *
- *   Dashed lines are direct loader dependencies, at the top of the ldd -v
- *   listing - they show all the things ld.so will load along with the
- *   root executable or shared object.
+ *   ld.so (the Linux ELF loader) will load and relocate every node of the output
+ *   graph -- all the objects listed at the top of the ldd -v output.
  *
  *   Solid lines are the versioned symbol requirement dependencies.
  *
+ *   Dotted lines are direct loader dependencies that weren't pulled in by
+ *   the more-explicit versioned symbol dependencies.
+ *
  * OPTIONS
- *   -    read ldd -v output on stdin 
+ *   -    read ldd -v output on stdin
  *   -?   provide help message
  *
  * EXAMPLES
@@ -40,7 +42,7 @@
  *   c++ -std=c++98 -o lddgraph lddgraph.cpp
  *
  * AUTHOR
- *   James Perkins, 19 April 2021
+ *   James Perkins, April 2021
  */
 
 /*
@@ -61,7 +63,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
  * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS 
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
 
@@ -154,24 +156,44 @@ class Edge
  private:
     Node *from;
     Node *to;
-    std::string label;
-    bool strong;
+    std::vector < std::string > labels;
 
  public:
+    std::string getLabels(std::string delimiter)
+    {
+        std::string out;
+
+        for (std::vector < std::string >::iterator ln = labels.begin();
+            ln != labels.end(); ++ln)
+        {
+            if (ln != labels.begin())
+            {
+                out += delimiter;
+            }
+
+            out += *ln;
+        }
+
+        return out;
+    };
+
     void dump(void)
     {
         DEBUG_OUT(std::cerr << "edge: from " << from->getPath() <<
-            " to " << to->getPath() << " label " << label <<
-            " strong " << strong << std::endl);
-    }
+            " to " << to->getPath() << " labels " <<
+            getLabels(" ") << std::endl);
+    };
 
-    Edge(Node * f, Node * t, std::string l, bool s)
+    Edge(Node * f, Node * t)
     {
         from = f;
         to = t;
-        label = l;
-        strong = s;
         this->dump();
+    };
+
+    void addLabel(std::string l)
+    {
+        labels.push_back(l);
     };
 
     Node *getFrom(void)
@@ -184,16 +206,51 @@ class Edge
         return to;
     };
 
-    std::string getLabel(void)
+    bool isLabeled(void)
     {
-        return label;
-    };
-
-    bool getStrong(void)
-    {
-        return strong;
+        return getLabels(" ") != "";
     };
 };
+
+static bool is_ELF_file(std::string path)
+{
+    FILE *fp = fopen(path.c_str(), "rb");
+
+    if (fp == NULL)
+    {
+        std::cerr << path << ": fopen failed: " << strerror(errno) << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    unsigned char s[4];
+
+    size_t n = fread(s, 1, sizeof(s), fp);
+
+    if (n == 0)
+    {
+        std::cerr << path << ": fread failed: " << strerror(errno) << std::endl;
+        fclose(fp);
+        exit(EXIT_FAILURE);
+    }
+
+    if (n < sizeof(s))
+    {
+        std::cerr << path << ": short read" << std::endl;
+        fclose(fp);
+        exit(EXIT_FAILURE);
+    }
+
+    fclose(fp);
+
+    unsigned char ELF_header[4] = { 0x7f, 'E', 'L', 'F' };
+
+    if (memcmp(s, ELF_header, sizeof(s)) != 0)
+    {
+        return false;
+    }
+
+    return true;
+}
 
 // Process an input file, producing a directed graph description on output
 void parse_file(const std::string patharg)
@@ -209,8 +266,7 @@ void parse_file(const std::string patharg)
     {
         fp = stdin;
     }
-    else if (access(path.c_str(), X_OK) == 0 ||
-        strstr(path.c_str(), ".so") != NULL)
+    else if (is_ELF_file(path))
     {
         // executable files and files with .so in the name
         std::string cmd("ldd -v ");
@@ -244,8 +300,6 @@ void parse_file(const std::string patharg)
     // create a root node for the input file, also referred to as nodes[0]
     Node *cur_node = new Node(trim_dot_slash(path));
     nodes.push_back(cur_node);
-
-    DEBUG_OUT(std::cerr << "node count " << nodes.size() << std::endl);
 
     // we're in the header of the ldd -v output until we see Version info:
     bool got_version_info = false;
@@ -313,12 +367,8 @@ void parse_file(const std::string patharg)
 
             nodes.push_back(sub_node);
 
-            DEBUG_OUT(std::cerr << "node count " << nodes.size() << std::endl);
-
-            Edge *edge = new Edge(cur_node, sub_node, "", false);
+            Edge *edge = new Edge(cur_node, sub_node);
             edges.push_back(edge);
-
-            DEBUG_OUT(std::cerr << "edge count " << edges.size() << std::endl);
 
             continue;
         }
@@ -387,14 +437,29 @@ void parse_file(const std::string patharg)
                 exit(EXIT_FAILURE);
             }
 
-            Edge *edge = new Edge(cur_node, sub_node, version, true);
-            edges.push_back(edge);
+            // add label to existing edge, or create new edge
 
-            DEBUG_OUT(std::cerr << "edge count " << edges.size() << std::endl);
+            bool found = false;
+
+            for (std::vector < Edge * >::iterator pe = edges.begin();
+                pe != edges.end(); ++pe)
+            {
+                if ((*pe)->getFrom() == cur_node && (*pe)->getTo() == sub_node)
+                {
+                    found = true;
+                    (*pe)->addLabel(version);
+                }
+            }
+
+            if (found == false)
+            {
+                Edge *edge = new Edge(cur_node, sub_node);
+                edge->addLabel(version);
+                edges.push_back(edge);
+            }
 
             continue;
         }
-
     }
 
     // if error, quit while we're behind
@@ -413,7 +478,8 @@ void parse_file(const std::string patharg)
 
     if (!is_pipe && fclose(fp) != 0)
     {
-        std::cerr << path.c_str() << ": fclose:" << strerror(errno) << std::endl;
+        std::cerr << path.c_str() << ": fclose: " << strerror(errno) <<
+            std::endl;
         exit(EXIT_FAILURE);
     }
 
@@ -430,8 +496,51 @@ void parse_file(const std::string patharg)
         (*pe)->dump();
     }
 
+    DEBUG_OUT(std::cerr << "edge count " << edges.size() << std::endl);
+
+    // erase unlabeled edges with a to node for which there is a labeled edge pointing to it
+    std::vector < Edge * >saved_edges;
+
+    for (std::vector < Edge * >::iterator pe = edges.begin(); pe != edges.end();
+        ++pe)
+    {
+        bool erase = false;
+
+        if ((*pe)->isLabeled())
+        {
+            goto save_edge;
+        }
+
+        for (std::vector < Edge * >::iterator pf = edges.begin();
+            pf != edges.end(); pf++)
+        {
+            if ((*pf)->isLabeled() && (*pf)->getTo() == (*pe)->getTo())
+            {
+                DEBUG_OUT(std::cerr << "removing ");
+                DEBUG_OUT((*pe)->dump());
+                DEBUG_OUT(std::cerr << " because ");
+                DEBUG_OUT((*pf)->dump());
+
+                erase = true;
+                break;
+            }
+        }
+
+ save_edge:
+        if (erase == false)
+        {
+            saved_edges.push_back(*pe);
+        }
+    }
+
+    edges = saved_edges;
+    DEBUG_OUT(std::cerr << "edge count " << edges.size() << std::endl);
+
     // Begin output file on stdout
     std::cout << "digraph G {" << std::endl;
+    std::cout << "info_block [shape=box, label=\"" << "file: " << path <<
+        "\\n" << "nodes: " << nodes.size() << "\\n" << "edges: " <<
+        edges.size() << "\"];" << std::endl;
 
     // For each node, emit a digraph node
     for (std::vector < Node * >::iterator pn = nodes.begin(); pn != nodes.end();
@@ -440,70 +549,35 @@ void parse_file(const std::string patharg)
         std::cout << (*pn)->getPathQuoted() << ";" << std::endl;
     }
 
-     // Find all edges matching a node from and node to, and emit one digraph
-     // edge that combines the labels into a single edge.
-    for (std::vector < Node * >::iterator pf = nodes.begin(); pf != nodes.end();
-        ++pf)
+    // Emit all edges
+
+    for (std::vector < Edge * >::iterator pe = edges.begin(); pe != edges.end();
+        ++pe)
     {
-        for (std::vector < Node * >::iterator pt = nodes.begin();
-            pt != nodes.end(); ++pt)
+        // emit the basic digraph edge
+        std::cout << (*pe)->getFrom()->getPathQuoted() << " -> " <<
+            (*pe)->getTo()->getPathQuoted();
+
+        // make the digraph edge solid if labeled, and dotted if not.
+
+        if ((*pe)->isLabeled())
         {
-            // skip self-references (there won't be any, anyway)
-            if (*pf == *pt)
-            {
-                continue;
-            }
-
-            // count matching edges, accumulate labels and strong (versioned) info
-            unsigned int nedges = 0;
-            bool strong = false;
-            std::string labels("");
-
-            for (std::vector < Edge * >::iterator pe = edges.begin();
-                pe != edges.end(); ++pe)
-            {
-                if ((*pe)->getFrom() == *pf && (*pe)->getTo() == *pt)
-                {
-                    nedges++;
-                    strong |= (*pe)->getStrong();
-                    std::string label = (*pe)->getLabel();
-                    if (label != "")
-                    {
-                        if (labels != "")
-                        {
-                            labels += "\\n";
-                        }
-                        labels += label;
-                    }
-                }
-            }
-
-            // no matching edges for this from and to?
-            if (nedges == 0)
-            {
-                continue;
-            }
-
-            // emit the basic digraph edge
-            std::cout << (*pf)->getPathQuoted() << " -> " <<
-                (*pt)->getPathQuoted();
-
-            // make the digraph edge dotted if no labels and not strong
-            // and solid with label list of there are labels.
-            if (labels == "")
-            {
-                if (!strong)
-                {
-                    std::cout << " [style=dotted]";
-                }
-            }
-            else
-            {
-                std::cout << " [label=\"" << labels << "\"]";
-            }
-
-            std::cout << ";" << std::endl;
+            std::string labels = (*pe)->getLabels("\\n");
+            std::cout << " [label=\"" << labels << "\"]";
         }
+        else
+        {
+            std::cout << " [style=dotted]";
+        }
+
+        std::cout << ";" << std::endl;
+    }
+
+    // constrain output location of info block
+    if (edges.size() > 0)
+    {
+        std::cout << edges[0]->getTo()->getPathQuoted() <<
+            " -> info_block [style=invis];" << std::endl;
     }
 
     // end digraph output
