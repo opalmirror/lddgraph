@@ -36,3 +36,7 @@ uninstall:
 .PHONY: clean
 clean:
 	$(RM) $(OBJS) lddgraph
+
+.PHONY: indent
+indent:
+	indent $(SRCS)
