@@ -89,28 +89,48 @@
 #define DEBUG_OUT(x)
 #endif
 
-// remove "./" from front of string
-static std::string trim_dot_slash(std::string s)
+/*************************
+ *  string helpers       
+ *************************/
+
+// remove string from front of string
+static std::string trim_front(const std::string s, const std::string x)
 {
-    unsigned int n = s.size();
-    return (n > 1 && s[0] == '.' && s[1] == '/') ? s.substr(2) : s;
+    size_t n = x.size();
+    return (s.substr(0, n) == x) ? s.substr(n) : s;
 }
 
-// remove ":" from end of string
-static std::string trim_trailing_colon(std::string s)
+// detect string at end of string
+static bool ends_with(const std::string s, const std::string x)
 {
-    unsigned int n = s.size();
-    return (n > 1 && s[n - 1] == ':') ? s.substr(0, n - 1) : s;
+    size_t n = s.size();
+    size_t m = x.size();
+    return n >= m && s.substr(n - m, m) == x;
+}
+
+// remove string from end of string
+static std::string trim_end(const std::string s, const std::string x)
+{
+    return ends_with(s, x) ? s.substr(0, s.size() - x.size()) : s;
+}
+
+// detect "(" at start and ")" at end of string
+static bool has_outer_parens(const std::string s)
+{
+    return ends_with(s, ")") && s[0] == '(';
 }
 
 // remove "(" from start and ")" from end of string
 static std::string trim_outer_parens(std::string s)
 {
-    unsigned int n = s.size();
-    return (n > 1 && s[0] == '(' && s[n - 1] == ')') ? s.substr(1, n - 2) : s;
+    return has_outer_parens(s) ? s.substr(1, s.size() - 2) : s;
 }
 
-// Node represents a dynamically loadable shared object, executable or shared object
+/*************************
+ *  Node
+ *************************/
+
+// Node represents a dynamically loadable executalbe or shared object
 class Node
 {
  private:
@@ -150,10 +170,15 @@ class Node
 
 typedef std::vector < Node * >Nodes;
 
+/*************************
+ *  Edge
+ *************************/
+
 // edge represents a single requirement between nodes and is labeled
 // with the symbol version. If it is a versioned requirement it is
 // marked as 'strong'. The non-strong requirements are marked with a
 // dotted line and the strong ones with a solid line.
+
 class Edge
 {
  private:
@@ -217,6 +242,11 @@ class Edge
 
 typedef std::vector < Edge * >Edges;
 
+/*************************
+ *  File helpers
+ *************************/
+
+// detect dynamically loaded Embedded Linker Format (ELF) file
 static bool is_ELF_file(std::string path)
 {
     // Open the file to determine if it is ELF
@@ -279,7 +309,11 @@ static bool is_ELF_file(std::string path)
     return true;
 }
 
-class PathFile
+/*************************
+ *  Parser
+ *************************/
+
+class Parser
 {
  private:
     std::string path;           // file pathname
@@ -355,7 +389,8 @@ class PathFile
         }
 
         // input: <path>: <libpath>: version `<symbol>' not found (required by <path>)
-        if (f.size() == 5 && f[2] == "version" && f[4] == "not")
+        if (f.size() == 5 && ends_with(f[0], ":") && ends_with(f[1], ":") &&
+            f[2] == "version" && f[4] == "not")
         {
             std::cerr <<
                 "some symbol versions are unresolvable, input: " << line;
@@ -388,7 +423,7 @@ class PathFile
                 field = f[0];
             }
 
-            Node *sub_node = new Node(trim_dot_slash(field));
+            Node *sub_node = new Node(trim_front(field, "./"));
             nodes.push_back(sub_node);
 
             Edge *edge = new Edge(cur_node, sub_node);
@@ -417,9 +452,9 @@ class PathFile
         }
 
         // input: <path>:
-        if (f.size() == 1)
+        if (f.size() == 1 && ends_with(f[0], ":"))
         {
-            std::string field = trim_dot_slash(trim_trailing_colon(f[0]));
+            std::string field = trim_front(trim_end(f[0], ":"), "./");
 
             // we've been waiting for the ldd output to tell us what the
             // real file's path is.
@@ -438,14 +473,14 @@ class PathFile
         }
 
         // input: <shared object> (<version>) => <path>
-        if (f.size() != 4)
+        if (f.size() != 4 && has_outer_parens(f[1]) && f[2] == "=>")
         {
             std::cerr << path << ": unrecognized line: " << line;
             return true;
         }
 
         std::string version(trim_outer_parens(f[1]));
-        std::string field = trim_dot_slash(f[3]);
+        std::string field = trim_front(f[3], "./");
         Node *sub_node = find_existing_node(nodes, field);
 
         // add label to existing or new edge
@@ -460,10 +495,61 @@ class PathFile
         edge->addLabel(version);
 
         return true;
-    }
+    };
+
+    Edge *find_edge_labeled_to(Edges & edges, Node * to)
+    {
+        for (Edges::iterator pn = edges.begin(); pn != edges.end(); pn++)
+        {
+            if ((*pn)->isLabeled() && (*pn)->getTo() == to)
+            {
+                return *pn;
+            }
+        }
+
+        return NULL;
+    };
+
+    // erase unlabeled edges with a to node for which there is a labeled
+    // edge pointing to it
+
+    void trim_unlabeled_edges(Edges & edges)
+    {
+        DEBUG_OUT(std::cerr << "edge count " << edges.size() << std::endl);
+
+        Edges saved_edges;
+
+        for (Edges::iterator pe = edges.begin(); pe != edges.end(); ++pe)
+        {
+            bool keep = true;
+
+            if (!(*pe)->isLabeled())
+            {
+                Edge *edge = find_edge_labeled_to(edges, (*pe)->getTo());
+
+                if (edge)
+                {
+                    DEBUG_OUT(std::cerr << "removing ");
+                    DEBUG_OUT((*pe)->dump());
+                    DEBUG_OUT(std::cerr << " because ");
+                    DEBUG_OUT(edge->dump());
+
+                    keep = false;
+                }
+            }
+
+            if (keep == true)
+            {
+                saved_edges.push_back(*pe);
+            }
+        }
+
+        edges = saved_edges;
+        DEBUG_OUT(std::cerr << "edge count " << edges.size() << std::endl);
+    };
 
  public:
-    PathFile(std::string p)
+    Parser(std::string p)
     {
         path = p;
         fp = NULL;
@@ -515,7 +601,7 @@ class PathFile
     void parse(Nodes & nodes, Edges & edges)
     {
         // create a root node for the input file, also referred to as nodes[0]
-        cur_node = new Node(trim_dot_slash(path));
+        cur_node = new Node(trim_front(path, "./"));
         nodes.push_back(cur_node);
 
         // read and process lines until EOF
@@ -554,58 +640,23 @@ class PathFile
 
         p = path;
     };
+
+    void finalize(Nodes & nodes, Edges & edges)
+    {
+        // Debug dump
+        for (Nodes::iterator pn = nodes.begin(); pn != nodes.end(); ++pn)
+        {
+            (*pn)->dump();
+        }
+
+        for (Edges::iterator pe = edges.begin(); pe != edges.end(); ++pe)
+        {
+            (*pe)->dump();
+        }
+
+        trim_unlabeled_edges(edges);
+    };
 };
-
-Edge *find_edge_labeled_to(Edges & edges, Node * to)
-{
-    for (Edges::iterator pn = edges.begin(); pn != edges.end(); pn++)
-    {
-        if ((*pn)->isLabeled() && (*pn)->getTo() == to)
-        {
-            return *pn;
-        }
-    }
-
-    return NULL;
-}
-
-// erase unlabeled edges with a to node for which there is a labeled
-// edge pointing to it
-
-void trim_unlabeled_edges(Edges & edges)
-{
-    DEBUG_OUT(std::cerr << "edge count " << edges.size() << std::endl);
-
-    Edges saved_edges;
-
-    for (Edges::iterator pe = edges.begin(); pe != edges.end(); ++pe)
-    {
-        bool keep = true;
-
-        if (!(*pe)->isLabeled())
-        {
-            Edge *edge = find_edge_labeled_to(edges, (*pe)->getTo());
-
-            if (edge)
-            {
-                DEBUG_OUT(std::cerr << "removing ");
-                DEBUG_OUT((*pe)->dump());
-                DEBUG_OUT(std::cerr << " because ");
-                DEBUG_OUT(edge->dump());
-
-                keep = false;
-            }
-        }
-
-        if (keep == true)
-        {
-            saved_edges.push_back(*pe);
-        }
-    }
-
-    edges = saved_edges;
-    DEBUG_OUT(std::cerr << "edge count " << edges.size() << std::endl);
-}
 
 void print_output(std::string & path, Nodes & nodes, Edges & edges)
 {
@@ -655,35 +706,30 @@ void print_output(std::string & path, Nodes & nodes, Edges & edges)
     std::cout << "}" << std::endl;
 }
 
+/*************************
+ *  Main helpers
+ *************************/
+
 // Process an input file, producing a directed graph description on output
-void parse_file(std::string path)
+void read_file(std::string path)
 {
-    PathFile pathfile(path);
+    Parser parser(path);
     Nodes nodes;
     Edges edges;
 
-    // read the input file, producing nodes and edges
-    pathfile.open();
-    pathfile.parse(nodes, edges);
-    pathfile.close(path);
-
-    // Debug dump
-    for (Nodes::iterator pn = nodes.begin(); pn != nodes.end(); ++pn)
-    {
-        (*pn)->dump();
-    }
-
-    for (Edges::iterator pe = edges.begin(); pe != edges.end(); ++pe)
-    {
-        (*pe)->dump();
-    }
-
-    trim_unlabeled_edges(edges);
+    // read the input file, producing nodes and edges, updating path
+    parser.open();
+    parser.parse(nodes, edges);
+    parser.close(path);
+    parser.finalize(nodes, edges);
 
     print_output(path, nodes, edges);
 }
 
-// main function
+/*************************
+ *  Main
+ *************************/
+
 int main(int ac, char **av)
 {
     // emit usage if:
@@ -700,7 +746,7 @@ int main(int ac, char **av)
     // iterate over input files
     while (--ac > 0)
     {
-        parse_file(*++av);
+        read_file(*++av);
     }
 
     exit(EXIT_SUCCESS);
