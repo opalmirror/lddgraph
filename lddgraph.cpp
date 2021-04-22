@@ -267,12 +267,14 @@ static bool is_ELF_file(std::string path)
         return false;
     }
 
+#if DEBUG
     // describe the file for debug folks
     unsigned int width = s[EI_CLASS] == ELFCLASS32 ? 32 :
         s[EI_CLASS] == ELFCLASS64 ? 64 : 0;
 
-    DEBUG_OUT(std::cerr << path << ": " << width << " bits, dynamic load file"
-        << std::endl);
+    std::cerr << path << ": " << width << " bits, dynamic load file"
+        << std::endl;
+#endif
 
     return true;
 }
