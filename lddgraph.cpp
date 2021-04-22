@@ -110,7 +110,7 @@ static std::string trim_outer_parens(std::string s)
     return (n > 1 && s[0] == '(' && s[n - 1] == ')') ? s.substr(1, n - 2) : s;
 }
 
-// Node represents a dynamically loadable shared object, executable or library
+// Node represents a dynamically loadable shared object, executable or shared object
 class Node
 {
  private:
@@ -288,6 +288,34 @@ class PathFile
     bool real_path_pending;     // ldd needs to tell us the pathname
     Node *cur_node;             // node to be used as from in edges
     bool got_version_info;      // false until we see Version info:
+    Node *not_found_node;       // virtual node for unfound objects
+
+    Node *find_existing_node(Nodes & nodes, std::string & path)
+    {
+        for (Nodes::iterator pn = nodes.begin(); pn != nodes.end(); ++pn)
+        {
+            if ((*pn)->getPath() == path)
+            {
+                return *pn;
+            }
+        }
+
+        std::cerr << path << ": cannot find prior reference!" << std::endl;
+        exit(EXIT_FAILURE);
+    };
+
+    Edge *find_edge_from_to(Edges & edges, Node * from, Node * to)
+    {
+        for (Edges::iterator pe = edges.begin(); pe != edges.end(); ++pe)
+        {
+            if ((*pe)->getFrom() == from && (*pe)->getTo() == to)
+            {
+                return *pe;
+            }
+        }
+
+        return NULL;
+    }
 
     bool process_line(Nodes & nodes, Edges & edges)
     {
@@ -313,11 +341,16 @@ class PathFile
             }
         }
 
+        // input:
+        if (f.size() == 0)
+        {
+            return true;
+        }
+
         // input: not a <...>
         if (f.size() == 4 && f[0] == "not" && f[1] == "a")
         {
-            std::cerr << path << ": not an dynamically loaded file" <<
-                std::endl;
+            std::cerr << path << ": not a dynamically loaded file" << std::endl;
             exit(EXIT_FAILURE);
         }
 
@@ -337,30 +370,49 @@ class PathFile
         }
 
         // input: <lib> (<loadaddr>)
+        // input: <lib> =>  (<loadaddr>)
         // input: <lib> => <path> (<loadaddr>)
-        if (got_version_info == false && (f.size() == 2 || f.size() == 4))
+        // input: <lib> => not found
+        if (got_version_info == false && (f.size() == 2 || f.size() == 3 ||
+                f.size() == 4))
         {
-            std::string field(f.size() == 2 ? f[0] : f[2]);
+            std::string field(f.size() == 4 ? f[2] : f[0]);
 
             // input: <lib> => not found
-            if (f.size() == 4 && f[2] == "not" && f[3] == "found")
+            bool not_found = f.size() == 4 && f[2] == "not" && f[3] == "found";
+
+            if (not_found)
             {
-                std::cerr << f[0] << ": library not found, input: " << line;
+                std::cerr << f[0] << ": shared object not found, input: " <<
+                    line;
                 field = f[0];
             }
 
             Node *sub_node = new Node(trim_dot_slash(field));
-
             nodes.push_back(sub_node);
 
             Edge *edge = new Edge(cur_node, sub_node);
             edges.push_back(edge);
+
+            // TODO test
+            if (not_found)
+            {
+                if (not_found_node == NULL)
+                {
+                    not_found_node = new Node("not found");
+                    nodes.push_back(not_found_node);
+                }
+
+                Edge *edge = new Edge(sub_node, not_found_node);
+                edges.push_back(edge);
+            }
 
             return true;
         }
 
         if (got_version_info == false)
         {
+            std::cerr << path << ": unrecognized line: " << line;
             return true;
         }
 
@@ -380,73 +432,32 @@ class PathFile
                 real_path_pending = false;
             }
 
-            Node *sub_node = NULL;
-
-            for (Nodes::iterator pn = nodes.begin(); pn != nodes.end(); ++pn)
-            {
-                if ((*pn)->getPath() == field)
-                {
-                    sub_node = *pn;
-                    break;
-                }
-            }
-
-            if (sub_node == NULL)
-            {
-                std::cerr << field <<
-                    ": cannot find prior reference!" << std::endl;
-                exit(EXIT_FAILURE);
-            }
-
-            cur_node = sub_node;
+            cur_node = find_existing_node(nodes, field);
 
             return true;
         }
 
-        // input: <library> (<version>) => <path>
+        // input: <shared object> (<version>) => <path>
         if (f.size() != 4)
         {
+            std::cerr << path << ": unrecognized line: " << line;
             return true;
         }
 
         std::string version(trim_outer_parens(f[1]));
         std::string field = trim_dot_slash(f[3]);
-        Node *sub_node = NULL;
+        Node *sub_node = find_existing_node(nodes, field);
 
-        for (Nodes::iterator pn = nodes.begin(); pn != nodes.end(); ++pn)
+        // add label to existing or new edge
+        Edge *edge = find_edge_from_to(edges, cur_node, sub_node);
+
+        if (edge == NULL)
         {
-            if ((*pn)->getPath() == field)
-            {
-                sub_node = *pn;
-                break;
-            }
-        }
-
-        if (sub_node == NULL)
-        {
-            std::cerr << field << ": cannot find prior reference!" << std::endl;
-            exit(EXIT_FAILURE);
-        }
-
-        // add label to existing edge, or create new edge
-
-        bool found = false;
-
-        for (Edges::iterator pe = edges.begin(); pe != edges.end(); ++pe)
-        {
-            if ((*pe)->getFrom() == cur_node && (*pe)->getTo() == sub_node)
-            {
-                found = true;
-                (*pe)->addLabel(version);
-            }
-        }
-
-        if (found == false)
-        {
-            Edge *edge = new Edge(cur_node, sub_node);
-            edge->addLabel(version);
+            edge = new Edge(cur_node, sub_node);
             edges.push_back(edge);
         }
+
+        edge->addLabel(version);
 
         return true;
     }
@@ -460,6 +471,7 @@ class PathFile
         real_path_pending = false;
         cur_node = NULL;
         got_version_info = false;
+        not_found_node = NULL;
     };
 
     void open(void)
@@ -516,7 +528,9 @@ class PathFile
         }
     };
 
-    void close()
+    // note, updates the p argument with final path
+    // as output by ldd
+    void close(std::string & p)
     {
         // if error, quit while we're behind
         if (!feof(fp))
@@ -537,41 +551,53 @@ class PathFile
                 std::endl;
             exit(EXIT_FAILURE);
         }
+
+        p = path;
     };
 };
+
+Edge *find_edge_labeled_to(Edges & edges, Node * to)
+{
+    for (Edges::iterator pn = edges.begin(); pn != edges.end(); pn++)
+    {
+        if ((*pn)->isLabeled() && (*pn)->getTo() == to)
+        {
+            return *pn;
+        }
+    }
+
+    return NULL;
+}
+
+// erase unlabeled edges with a to node for which there is a labeled
+// edge pointing to it
 
 void trim_unlabeled_edges(Edges & edges)
 {
     DEBUG_OUT(std::cerr << "edge count " << edges.size() << std::endl);
 
-    // erase unlabeled edges with a to node for which there is a labeled edge pointing to it
     Edges saved_edges;
 
     for (Edges::iterator pe = edges.begin(); pe != edges.end(); ++pe)
     {
-        bool erase = false;
+        bool keep = true;
 
-        if ((*pe)->isLabeled())
+        if (!(*pe)->isLabeled())
         {
-            goto save_edge;
-        }
+            Edge *edge = find_edge_labeled_to(edges, (*pe)->getTo());
 
-        for (Edges::iterator pf = edges.begin(); pf != edges.end(); pf++)
-        {
-            if ((*pf)->isLabeled() && (*pf)->getTo() == (*pe)->getTo())
+            if (edge)
             {
                 DEBUG_OUT(std::cerr << "removing ");
                 DEBUG_OUT((*pe)->dump());
                 DEBUG_OUT(std::cerr << " because ");
-                DEBUG_OUT((*pf)->dump());
+                DEBUG_OUT(edge->dump());
 
-                erase = true;
-                break;
+                keep = false;
             }
         }
 
- save_edge:
-        if (erase == false)
+        if (keep == true)
         {
             saved_edges.push_back(*pe);
         }
@@ -639,7 +665,7 @@ void parse_file(std::string path)
     // read the input file, producing nodes and edges
     pathfile.open();
     pathfile.parse(nodes, edges);
-    pathfile.close();
+    pathfile.close(path);
 
     // Debug dump
     for (Nodes::iterator pn = nodes.begin(); pn != nodes.end(); ++pn)
